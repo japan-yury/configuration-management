@@ -1,0 +1,142 @@
+# Disable the Gradle daemon for Continuous Integration servers as correctness
+# is usually a priority over speed in CI environments. Using a fresh
+# runtime for each build is more reliable since the runtime is completely
+# isolated from any previous builds.
+variables:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+  JAVA_DEBUG: "false"
+
+stages:
+  - get_secrets
+  - get_version
+  - building
+  - testing
+  - publishing
+  - cleaning
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_REF_NAME =~ /^RT-/
+      variables:
+        JAVA_DEBUG: "true"
+    - when: always
+
+init_secrets:
+  stage: get_secrets
+  image: vault:1.9.10
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - export VAULT_TOKEN=$(vault write -field=token auth/${VAULT_AUTH_PATH}/login role=${VAULT_AUTH_ROLE} jwt=$CI_JOB_JWT)
+  script:
+    - export NEXUS_USERNAME=$(vault kv get -field=NEXUS_USERNAME ${VAULT_CREDS_PATH})
+    - export NEXUS_PASSWORD=$(vault kv get -field=NEXUS_PASSWORD ${VAULT_CREDS_PATH})
+    - echo "NEXUS_USERNAME=$NEXUS_USERNAME" >> vault_secrets.env
+    - echo "NEXUS_PASSWORD=$NEXUS_PASSWORD" >> vault_secrets.env
+  artifacts:
+    reports:
+      dotenv: vault_secrets.env
+    expire_in: 10 mins
+  allow_failure: false
+
+before_script:
+  - GRADLE_USER_HOME="$(pwd)/.gradle"
+  - export GRADLE_USER_HOME
+  - apk add git --no-cache
+  - git init
+  - git status
+
+.cache: &job_cache
+  key: "$CI_COMMIT_REF_NAME"
+  policy: pull
+  paths:
+    - build
+    - .gradle
+    - .git
+
+init_version:
+  stage: get_version
+  image: alpine/git:2.36.3
+  before_script:
+    - git status
+    - apk add bash --no-cache
+    - LATEST_KNOWN_VERSION=$(git tag -l | sort -V | tail -1)
+    - LATEST_VERSION="$(if [ "$LATEST_KNOWN_VERSION" == '' ]; then echo "0.0.0"; else echo "${LATEST_KNOWN_VERSION}"; fi)"
+    - echo $LATEST_VERSION
+  script:
+    - NEXT_VERSION="$(if [ "$LATEST_KNOWN_VERSION" == '' ]; then echo "$LATEST_VERSION"; else echo "${LATEST_VERSION}" | awk -F. -v OFS=. '{$NF += 1 ; print}'; fi)"
+    - echo "LATEST_VERSION=$LATEST_VERSION" >> git_version.env
+    - echo "NEXT_VERSION=$NEXT_VERSION" >> git_version.env
+    - echo "$NEXT_VERSION"
+  cache:
+    <<: *job_cache
+  artifacts:
+    reports:
+      dotenv: git_version.env
+    expire_in: 10 mins
+  allow_failure: false
+
+build_image:
+  stage: building
+  image: gradle:7.5.1-jdk17-alpine
+  script:
+    - gradle --build-cache build
+  cache:
+    <<: *job_cache
+    policy: pull-push
+
+test:
+  stage: testing
+  image: gradle:7.5.1-jdk17-alpine
+  script:
+    - gradle --build-cache check
+  cache:
+    <<: *job_cache
+  needs:
+    - build_image
+
+publish:
+  stage: publishing
+  image: gradle:7.5.1-jdk17-alpine
+  before_script:
+    - echo $NEXT_VERSION
+    - MASTER_LABEL="${NEXT_VERSION}-master-${CI_COMMIT_SHORT_SHA}"
+    - echo $MASTER_LABEL
+    - echo $JAVA_DEBUG
+  script:
+    - gradle --build-cache bootBuildImage -PdockerRegistryHost=${DOCKER_REGISTRY} -PdockerUsername=${NEXUS_USERNAME} -PdockerPassword=${NEXUS_PASSWORD} -Ptag=${NEXT_VERSION}-${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA} -PjavaDebugEnabled=${JAVA_DEBUG}
+    - >
+      if [ "$CI_COMMIT_REF_NAME" == "master" ]; then
+        gradle --build-cache bootBuildImage -PdockerRegistryHost=${DOCKER_REGISTRY} -PdockerUsername=${NEXUS_USERNAME} -PdockerPassword=${NEXUS_PASSWORD} -Ptag="latest" -PlabelVersion=${MASTER_LABEL}
+      else
+        gradle --build-cache bootBuildImage -PdockerRegistryHost=${DOCKER_REGISTRY} -PdockerUsername=${NEXUS_USERNAME} -PdockerPassword=${NEXUS_PASSWORD} -Ptag=${CI_COMMIT_REF_NAME} -PjavaDebugEnabled=${JAVA_DEBUG}
+      fi
+  after_script:
+    - rm -f vault_secrets.env || true
+  cache:
+    <<: *job_cache
+  needs:
+    - build_image
+    - test
+    - job: init_secrets
+      artifacts: true
+    - job: init_version
+      artifacts: true
+
+.cleanup: &cleanup
+  stage: cleaning
+  script:
+    - rm -f vault_secrets.env || true
+
+cleanup_on_failure:
+  needs:
+    - job: init_secrets
+      optional: true
+    - job: init_version
+      optional: true
+    - job: build_image
+      optional: true
+  when: on_failure
+  <<: *cleanup
+
+
